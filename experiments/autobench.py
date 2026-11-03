@@ -1,7 +1,8 @@
 """B200-only, sequential benchmark of minimal OFA tuning parameters.
 
 One-time data setup (upstream): modal run b200-run/modal_app.py --step prep
-Then: modal run experiments/autobench.py --suite quick
+Preflight: modal run experiments/autobench.py --suite preflight (CPU only)
+Then: modal run experiments/autobench.py --suite quick (paid B200)
 Inspect offline: python3 experiments/plan.py
 
 IMPORTANT: --suite quick RENTS A GPU. Results are NOT asserted until they run.
@@ -22,19 +23,48 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "b200-run"))
 import modal  # installed by `pip install modal`
-import modal_app as upstream
 from experiments.analyze import aggregate, loss_file, parse_log, read_tokens, validate_loss, validate_tokens, write_results, write_charts
 from experiments.plan import plan
 
 app = modal.App("ofa-autobench")
-# Reuse Jerry's already defined CUDA+DOOM image, including all pinned dependencies.
-# These extra builds happen in Modal image construction, NOT on a rented B200.
-image = upstream.tc_img.run_commands(
-    f"cd {upstream.MK} && MODEL=S bash build.sh sm_100a ofa_hr64 -DOFA_GEMM_BACKEND=1 -DGEMM100_STAGES=2 -DDECODE_HR=64",
-    f"cd {upstream.MK} && MODEL=S bash build.sh sm_100a ofa_hr256 -DOFA_GEMM_BACKEND=1 -DGEMM100_STAGES=2 -DDECODE_HR=256",
-)
+VOLUME_MOUNT = "/vol"
+DATA = "/vol/data"
+RES = "/vol/results"
+MK = "/opt/ofa/llm/b200/megakernel"
+vol = modal.Volume.from_name("ofa-b200-data", create_if_missing=True)
+
+# Modal re-imports this file INSIDE remote containers. The upstream image-definition
+# script is only importable/buildable from the local repo, so never import it there.
+if modal.is_local():
+    import modal_app as upstream
+    assert (upstream.MK, upstream.DATA, upstream.RES, upstream.V) == (MK, DATA, RES, VOLUME_MOUNT), \
+        "Upstream Modal paths changed; recheck benchmark assumptions"
+    # Reuse upstream's CUDA + Doom image, and mount the pure-Python helper package.
+    # These builds are image-build work, NOT B200 benchmark GPU work.
+    image = upstream.tc_img.run_commands(
+        f"cd {MK} && MODEL=S bash build.sh sm_100a ofa_hr64 -DOFA_GEMM_BACKEND=1 -DGEMM100_STAGES=2 -DDECODE_HR=64",
+        f"cd {MK} && MODEL=S bash build.sh sm_100a ofa_hr256 -DOFA_GEMM_BACKEND=1 -DGEMM100_STAGES=2 -DDECODE_HR=256",
+    ).add_local_python_source("experiments")
+    preflight_image = modal.Image.debian_slim(python_version="3.12").add_local_python_source("experiments")
+else:
+    # Remote module loading must not reference local repo paths or import modal_app.
+    # Modal uses the image/volume configured by the LOCAL app deployment; these
+    # placeholders are only for evaluating decorators during remote module import.
+    image = modal.Image.debian_slim(python_version="3.12")
+    preflight_image = image
+
 BINARIES = {64: "ofa_hr64", 128: "ofa_tc2", 256: "ofa_hr256"}
-SUITE_VERSION = "ofa001-v1"
+SUITE_VERSION = "ofa001-v2"
+
+
+@app.function(image=preflight_image, cpu=1, memory=512, timeout=90, max_containers=1, retries=0)
+def preflight() -> dict:
+    """Remote, CPU-only check that the function module and helper modules import."""
+    from experiments import analyze, plan as plan_module
+    if not callable(analyze.parse_log) or not callable(plan_module.plan):
+        raise RuntimeError("Autobench helper modules missing in remote container")
+    return {"status": "ready", "gpu_used": False, "analyze": analyze.__file__,
+            "plan": plan_module.__file__}
 
 
 def invoke(cmd: list[str], cwd: str, timeout: int) -> tuple[int, str]:
@@ -51,9 +81,9 @@ def invoke(cmd: list[str], cwd: str, timeout: int) -> tuple[int, str]:
 
 def build_command(hr: int, steps: int, doom: int, output: Path, *, greedy: bool = False) -> list[str]:
     """Fixed dataset, seed, prompt, optimizer settings; Doom allocation changes only one dimension."""
-    cmd = [f"./{BINARIES[hr]}", "--steps", str(steps), "--data", f"{upstream.DATA}/tinystories_cl100k_train.u32",
-           "--init", f"{upstream.DATA}/init_flat_S.f32", "--starts", f"{upstream.DATA}/starts_4000.u32",
-           "--prompt", f"{upstream.DATA}/prompt_ids_fa.txt", "--answer-len", "256", "--seed", "1234",
+    cmd = [f"./{BINARIES[hr]}", "--steps", str(steps), "--data", f"{DATA}/tinystories_cl100k_train.u32",
+           "--init", f"{DATA}/init_flat_S.f32", "--starts", f"{DATA}/starts_4000.u32",
+           "--prompt", f"{DATA}/prompt_ids_fa.txt", "--answer-len", "256", "--seed", "1234",
            "--infer-sms", "24", "--doom-sms", str(doom), "--train-sms", str(124 - doom),
            "--loss-out", str(output / "loss.txt"), "--text-out", str(output / "tokens.txt")]
     if doom:
@@ -65,7 +95,7 @@ def build_command(hr: int, steps: int, doom: int, output: Path, *, greedy: bool 
     return cmd
 
 
-@app.function(gpu="B200", image=image, volumes={upstream.V: upstream.vol},
+@app.function(gpu="B200", image=image, volumes={VOLUME_MOUNT: vol},
               cpu=8.0, memory=32768, timeout=5400)
 def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
               explore_one_sm: bool = False, run_id: str = SUITE_VERSION) -> dict:
@@ -75,9 +105,9 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
         raise ValueError("run_id must be alphanumeric with optional -/_")
     if not 20 <= steps <= 4000 or not 2 <= repeats <= 5 or confirm_steps < steps or confirm_steps > 10000:
         raise ValueError("invalid steps, repeats or confirmation steps")
-    upstream.vol.reload()
-    required = [f"{upstream.DATA}/tinystories_cl100k_train.u32", f"{upstream.DATA}/init_flat_S.f32",
-                f"{upstream.DATA}/starts_4000.u32", f"{upstream.DATA}/prompt_ids_fa.txt",
+    vol.reload()
+    required = [f"{DATA}/tinystories_cl100k_train.u32", f"{DATA}/init_flat_S.f32",
+                f"{DATA}/starts_4000.u32", f"{DATA}/prompt_ids_fa.txt",
                 "/opt/ofa/doom-gpu/doom1.wad"]
     missing = [x for x in required if not os.path.isfile(x)]
     if missing:
@@ -86,9 +116,9 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
     gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True).strip()
     if "B200" not in gpu:
         raise RuntimeError("Benchmark expects B200, got " + gpu)
-    root = Path(upstream.RES) / "ofa_autobench" / run_id
+    root = Path(RES) / "ofa_autobench" / run_id
     root.mkdir(parents=True, exist_ok=True)
-    binary_sha = {h: hashlib.sha256((Path(upstream.MK) / b).read_bytes()).hexdigest()
+    binary_sha = {h: hashlib.sha256((Path(MK) / b).read_bytes()).hexdigest()
                   for h, b in BINARIES.items()}
     records: list[dict] = []
     comments = [f"GPU: {gpu}; suite {SUITE_VERSION}; steps={steps}, repeats={repeats}",
@@ -110,7 +140,7 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
             except (OSError, ValueError):
                 pass
         start = time.monotonic()
-        rc, log = invoke(command, upstream.MK, 240 if greedy else (900 if nsteps <= 4000 else 1800))
+        rc, log = invoke(command, MK, 240 if greedy else (900 if nsteps <= 4000 else 1800))
         (folder / "run.log").write_text(log)
         metrics = parse_log(log)
         # A completed run without metrics is a failure, NOT a zero-throughput measurement.
@@ -129,7 +159,7 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
                   "ok": bool(basic), "loss_final": losses[-1] if losses else None,
                   "signature": signature, **metrics}
         record_path.write_text(json.dumps(record, indent=2) + "\n")
-        upstream.vol.commit()
+        vol.commit()
         return record
 
     # Frozen-weight greedy validation: compare only the first 128 common tokens.
@@ -159,7 +189,7 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
                 ok, error = validate_loss(baseline_loss, loss_file(root / f"quick_hr{h}_r{rep}" / "loss.txt"))
                 r = {**r, "ok": bool(ok), "max_loss_error": error}
             records.append(r)
-        upstream.vol.commit()
+        vol.commit()
     base_runs = [r for r in records if r["config"] == "HR128/Doom8" and r["ok"]]
     if len(base_runs) != repeats:
         raise RuntimeError("Repeated baseline failed; inspect B200 logs in " + str(root))
@@ -200,7 +230,7 @@ def run_suite(steps: int = 600, repeats: int = 2, confirm_steps: int = 4000,
     rank = aggregate([r for r in records if not r["config"].startswith("CONFIRM ")], baseline)
     report = write_results(root, records, rank, comments)
     write_charts(root, rank)
-    upstream.vol.commit()
+    vol.commit()
     return {"run_id": run_id, "gpu": gpu, "baseline": baseline, "quick_winner": winner,
             "confirm": [{k: r.get(k) for k in ("config", "ok", "train_tokens_s", "sampled_tokens_s", "doom_fps", "loss_final")} for r in confirm],
             "report": report, "volume_results": str(root)}
@@ -214,8 +244,17 @@ def main(suite: str = "quick", steps: int = 600, repeats: int = 2, confirm_steps
             print(*entry, sep=" | ")
         print("No GPU job submitted.")
         return
-    if suite != "quick":
-        raise ValueError("--suite must be quick or dry-run")
+    if suite not in ("quick", "preflight"):
+        raise ValueError("--suite must be quick, preflight or dry-run")
+    print("Checking remote Python imports using a CPU-only Modal container (no GPU)...", flush=True)
+    check = preflight.remote()  # stops here if remote imports are broken
+    if check.get("status") != "ready" or check.get("gpu_used") is not False:
+        raise RuntimeError(f"Unexpected remote preflight result: {check!r}")
+    print("Remote import preflight PASSED:", check, flush=True)
+    if suite == "preflight":
+        print("No B200 GPU job submitted.")
+        return
+    print("Preflight passed; starting paid B200 benchmark...", flush=True)
     result = run_suite.remote(steps=steps, repeats=repeats, confirm_steps=confirm_steps,
                               explore_one_sm=explore_one_sm, run_id=run_id)
     dest = ROOT / "experiments" / "results" / run_id
