@@ -1,0 +1,103 @@
+name: Apply OFA update 002 (Modal import fix)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ofa-overlay-experiment-autobench
+      cancel-in-progress: false
+    steps:
+      - name: Check out experiment/autobench (not main)
+        uses: actions/checkout@v4
+        with:
+          ref: experiment/autobench
+          persist-credentials: true
+
+      - name: Verify and install Overlay 002
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, stat, subprocess, sys, zipfile
+          root = pathlib.Path.cwd().resolve()
+          source = root / 'updates/ofa-update-002.zip'
+          if not source.is_file() or source.is_symlink():
+              sys.exit('Upload the ZIP to experiment/autobench at updates/ofa-update-002.zip')
+          if subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip():
+              sys.exit('Refusing to modify dirty checkout')
+          sha = lambda data: hashlib.sha256(data).hexdigest()
+          expected = {
+              'experiments/autobench.py': 'replace',
+              'experiments/OVERLAY-002.md': 'add',
+              'experiments/tests/test_autobench_imports.py': 'add',
+          }
+          original = '6bb600e4f1c84dfa09a7ecfa15969a7765acf9c63981b51cdd2c3fe5b15c360f'
+          with zipfile.ZipFile(source) as z:
+              items = z.infolist()
+              if len(items) != len(expected) + 1 or sum(i.file_size for i in items) > 300000:
+                  sys.exit('Unexpected ZIP size or entry count')
+              names = [i.filename for i in items]
+              if len(names) != len(set(names)) or set(names) != {'manifest.json'} | {'files/' + x for x in expected}:
+                  sys.exit('ZIP contains missing/extra/duplicate paths')
+              for i in items:
+                  p = pathlib.PurePosixPath(i.filename)
+                  if (i.is_dir() or p.is_absolute() or '..' in p.parts or '\\' in i.filename
+                          or '\x00' in i.filename or stat.S_IFMT(i.external_attr >> 16) == stat.S_IFLNK
+                          or i.file_size > 250000):
+                      sys.exit('Unsafe ZIP entry: ' + i.filename)
+              m = json.loads(z.read('manifest.json'))
+              if m.get('id') != 'ofa-002' or m.get('upstream_repository') != 'Bobliuuu/open-flapping-airplanes':
+                  sys.exit('Wrong overlay ID or repository')
+              replace = m.get('replace_files')
+              adds = m.get('add_files')
+              if not isinstance(replace, list) or not isinstance(adds, list):
+                  sys.exit('Missing manifest file lists')
+              records = replace + adds
+              if len(records) != len(expected) or {r['path'] for r in records} != set(expected):
+                  sys.exit('Unexpected manifest target list')
+              if [r['path'] for r in replace] != ['experiments/autobench.py']:
+                  sys.exit('Wrong replacement file')
+              if {r['path'] for r in adds} != {x for x in expected if expected[x] == 'add'}:
+                  sys.exit('Wrong addition file list')
+              if replace[0].get('expected_sha256') != original:
+                  sys.exit('Wrong expected Overlay 001 version')
+              for record in records:
+                  path = record['path']
+                  target = root / path
+                  for ancestor in [target, *target.parents]:
+                      if ancestor == root: break
+                      if ancestor.is_symlink():
+                          sys.exit('Symlink in target path: ' + path)
+                  if sha(z.read('files/' + path)) != record['sha256']:
+                      sys.exit('Checksum mismatch for ' + path)
+                  if expected[path] == 'add':
+                      if target.exists():
+                          sys.exit('Destination exists: ' + path)
+                  else:
+                      if not target.is_file() or sha(target.read_bytes()) != original:
+                          sys.exit('Overlay 001 file is missing or differs: ' + path)
+              for record in records:
+                  target = root / record['path']
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(z.read('files/' + record['path']))
+          print('Overlay 002 installed in working tree; starting CPU checks')
+          PY
+
+      - name: Run CPU regression and simulated remote import test (no GPU)
+        run: bash experiments/check_local.sh
+
+      - name: Commit only verified Overlay 002 changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- experiments/autobench.py experiments/OVERLAY-002.md experiments/tests/test_autobench_imports.py
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No updates to commit'; exit 1; }
+          git commit -m 'OFA overlay 002: fix Modal remote imports and add CPU preflight'
+          git push origin HEAD:experiment/autobench
