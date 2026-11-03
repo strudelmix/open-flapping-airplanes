@@ -1,0 +1,68 @@
+name: Apply OFA update ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Repository-relative ZIP path, e.g. updates/ofa-update-001.zip'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref_name == 'experiment/autobench'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out experiment branch
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Validate and extract update
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, zipfile, sys, shutil
+          root = pathlib.Path.cwd().resolve()
+          rel = pathlib.PurePosixPath(os.environ['ZIP_PATH'])
+          if rel.is_absolute() or '..' in rel.parts or not str(rel).startswith('updates/') or rel.suffix.lower() != '.zip':
+              sys.exit('Invalid ZIP path')
+          zpath = root.joinpath(*rel.parts)
+          if not zpath.is_file():
+              sys.exit(f'ZIP not found: {rel}')
+          with zipfile.ZipFile(zpath) as z:
+              files = [i for i in z.infolist() if not i.is_dir()]
+              if not files or len(files) > 200:
+                  sys.exit('Unexpected number of files')
+              for item in files:
+                  name = item.filename
+                  p = pathlib.PurePosixPath(name)
+                  if p.is_absolute() or '..' in p.parts or '\\' in name or not name or name.startswith('/'):
+                      sys.exit(f'Unsafe archive entry: {name}')
+                  if p.parts[0] in ('.git', '.github', 'updates'):
+                      sys.exit(f'Protected path: {name}')
+                  if (item.external_attr >> 16) & 0o170000 == 0o120000:
+                      sys.exit(f'Symlink rejected: {name}')
+                  if item.file_size > 5_000_000:
+                      sys.exit(f'Oversized file: {name}')
+                  target = root.joinpath(*p.parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with z.open(item) as src, target.open('wb') as dst:
+                      shutil.copyfileobj(src, dst)
+          PY
+      - name: Commit applied changes
+        env:
+          ZIP_PATH: ${{ inputs.zip_path }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- . ':!updates/' ':!.github/'
+          if git diff --cached --quiet; then
+            echo 'No source changes to commit'
+          else
+            git commit -m "Apply OFA update: ${ZIP_PATH}"
+            git push
+          fi
