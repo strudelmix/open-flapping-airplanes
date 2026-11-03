@@ -49,6 +49,7 @@
 #include "../../attention/attention.cuh"
 #include "../../elementwise/ew_all.cuh"
 #include "decode_wide.cuh"
+#include "safe_limits.hpp"
 
 #include "doom_job.cuh"        // Doom job (device + host setup), see that header
 #include "dashboard.cuh"       // HTTP dashboard server + sampler (host only)
@@ -412,6 +413,10 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-doom")) no_doom = true;
     else if (!strcmp(argv[i], "--no-opt")) nopt = 1; else if (is("--opt-mode")) opt_mode = atoi(argv[++i]);
   }
+  if (steps < 5) {
+    fprintf(stderr, "--steps must be at least 5 (required by steady-state reporting)\n");
+    return 2;
+  }
   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
   const int nsm = prop.multiProcessorCount;
   {  // resolve the partition: explicit flags > env > --split/OFA_SPLIT > (none: train only)
@@ -643,6 +648,10 @@ int main(int argc, char** argv) {
   std::vector<int> prefix(nph + 1, 0); for (int i = 0; i < nph; i++) prefix[i + 1] = prefix[i] + Bd.ntasks[i];
   const int tps = prefix[nph];
   printf("training graph: %d phases, %d tasks per step\n", nph, tps);
+  if (!ofa_limits::steps_safe(steps, tps, Bd.ntasks)) {
+    fprintf(stderr, "unsafe training steps=%d; scheduler permits at most %d for this graph\n", steps, ofa_limits::max_safe_steps(tps, Bd.ntasks));
+    return 2;
+  }
 
   auto upload_job = [&](Builder& b, std::vector<int>& pre, int limit, int last, Job& J) {
     int n = (int)b.ph.size();
@@ -680,7 +689,12 @@ int main(int argc, char** argv) {
       Dd.add("decode", d, {p - 1}, p == 0 ? std::vector<int2>{make_int2(DC::PHASES - 1, -1)} : std::vector<int2>{});
     }
     dprefix.assign(DC::PHASES + 1, 0); for (int i = 0; i < DC::PHASES; i++) dprefix[i + 1] = dprefix[i] + Dd.ntasks[i];
-    upload_job(Dd, dprefix, 1 << 22, DC::PHASES - 1, C.dec);
+    const int decode_limit = ofa_limits::max_safe_steps(dprefix[DC::PHASES], Dd.ntasks, out_cap);
+    if (decode_limit <= 0) { fprintf(stderr, "invalid decode scheduler bounds\n"); return 2; }
+    if (decode_limit < (1 << 22)) {
+      printf("decode safety: cap %d tokens (was %d; 32-bit ticket, signed completion counters, output buffer)\n", decode_limit, 1 << 22);
+    }
+    upload_job(Dd, dprefix, decode_limit, DC::PHASES - 1, C.dec);
     printf("decode job: %d phases, %d tasks per token; partition: infer SMs [0,%d), doom [%d,%d), train rest\n", DC::PHASES, dprefix[DC::PHASES], infer_sms, infer_sms, infer_sms + doom_sms);
   }
 

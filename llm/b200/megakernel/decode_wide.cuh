@@ -40,6 +40,7 @@ struct Cfg {
   static_assert(DH == 64 && D_ == H_ * 64, "dh must be 64");
   static_assert(D_ % 256 == 0 && D_ <= 2048, "D % 256 == 0, D <= 2048");   // widened from 1024 for config F (L=4, d=2048)
   static_assert(V_ % HR_ == 0 && HR_ % 64 == 0, "V % HR");
+  static_assert(HR_ <= NTHREADS, "head tile cannot exceed the 256-thread candidate reduction");
 };
 using ModelS = Cfg<12, 768, 12, 512, 100352>;
 using ModelM = Cfg<16, 1024, 16, 512, 100352>;
