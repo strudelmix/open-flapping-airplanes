@@ -1,0 +1,116 @@
+name: Apply OFA update ZIP (verified)
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_path:
+        description: 'Committed ZIP path, for example updates/ofa-update-001.zip'
+        required: true
+        default: 'updates/ofa-update-001.zip'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ofa-overlay-experiment-autobench
+      cancel-in-progress: false
+    steps:
+      - name: Check out selected experiment branch
+        uses: actions/checkout@v4
+        with:
+          ref: experiment/autobench
+          persist-credentials: true
+      - name: Validate original file versions and apply overlay
+        env:
+          OVERLAY_ZIP: ${{ inputs.zip_path }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, stat, subprocess, sys, tempfile, zipfile
+          root = pathlib.Path.cwd().resolve()
+          supplied = os.environ['OVERLAY_ZIP']
+          if not re.fullmatch(r'updates/[A-Za-z0-9._-]+\.zip', supplied):
+              sys.exit('ZIP must be directly in updates/ and have a simple .zip filename')
+          zpath = root / supplied
+          if not zpath.is_file() or zpath.is_symlink():
+              sys.exit(f'No committed ZIP at {supplied}')
+          if subprocess.check_output(['git','status','--porcelain'], text=True).strip():
+              sys.exit('Checkout is not clean')
+          with zipfile.ZipFile(zpath) as z:
+              infos = z.infolist()
+              if not 2 <= len(infos) <= 100 or sum(x.file_size for x in infos) > 5_000_000:
+                  sys.exit('Unexpected archive size or entry count')
+              names = [x.filename for x in infos]
+              if len(set(names)) != len(names):
+                  sys.exit('Duplicate paths in ZIP')
+              for x in infos:
+                  p = pathlib.PurePosixPath(x.filename)
+                  mode = x.external_attr >> 16
+                  if x.is_dir() or p.is_absolute() or '..' in p.parts or '\\' in x.filename or '\x00' in x.filename:
+                      sys.exit(f'Unsafe ZIP entry: {x.filename}')
+                  if stat.S_IFMT(mode) == stat.S_IFLNK or x.file_size > 2_000_000:
+                      sys.exit(f'Unsafe ZIP file type or size: {x.filename}')
+              manifest = json.loads(z.read('manifest.json'))
+              if manifest.get('id') != 'ofa-001' or manifest.get('upstream_repository') != 'Bobliuuu/open-flapping-airplanes':
+                  sys.exit('Wrong update identity or upstream')
+              sha = lambda b: hashlib.sha256(b).hexdigest()
+              expected_files = {}
+              for entry in manifest['files']:
+                  target = entry['path']
+                  p = pathlib.PurePosixPath(target)
+                  if (p.is_absolute() or '..' in p.parts or not target.startswith(('experiments/', 'llm/b200/megakernel/'))
+                          or p.parts[0] in ('.git','.github','updates')):
+                      sys.exit(f'Invalid destination: {target}')
+                  if target in expected_files:
+                      sys.exit(f'Duplicate manifest target: {target}')
+                  expected_files[target] = entry['sha256']
+              expected = {'manifest.json', manifest['patch']['path']} | {'files/' + p for p in expected_files}
+              if set(names) != expected:
+                  sys.exit(f'Unexpected or missing ZIP entries: {set(names) ^ expected}')
+              patches = manifest['patch']['path']
+              if patches != 'changes.patch' or sha(z.read(patches)) != manifest['patch']['sha256']:
+                  sys.exit('Patch checksum mismatch')
+              for target, digest in expected_files.items():
+                  if sha(z.read('files/' + target)) != digest:
+                      sys.exit('File checksum mismatch: ' + target)
+                  dst = root / target
+                  if dst.exists() or dst.is_symlink() or any((root / pathlib.Path(*dst.relative_to(root).parts[:i])).is_symlink() for i in range(1, len(dst.relative_to(root).parts))):
+                      sys.exit('Destination already exists or is symlinked: ' + target)
+              allowed = manifest['expected_git_blobs']
+              if set(allowed) != {'llm/b200/megakernel/ofa.cu', 'llm/b200/megakernel/decode_wide.cuh'}:
+                  sys.exit('Unexpected patch target set')
+              for target, blob in allowed.items():
+                  actual = subprocess.check_output(['git', 'hash-object', target], text=True).strip()
+                  if actual != blob:
+                      sys.exit(f'Base source mismatch: {target}: expected {blob}, got {actual}')
+              patch_text = z.read(patches)
+              changed = re.findall(rb'^diff --git a/(.*?) b/(.*?)$', patch_text, re.M)
+              if not changed or set(x.decode() for a,b in changed for x in (a,b)) != set(allowed):
+                  sys.exit('Patch changes files outside the declared source set')
+              with tempfile.TemporaryDirectory() as temp:
+                  patchfile = pathlib.Path(temp)/'changes.patch'
+                  patchfile.write_bytes(patch_text)
+                  subprocess.run(['git','apply','--check','--whitespace=error',str(patchfile)],check=True)
+                  subprocess.run(['git','apply','--whitespace=error',str(patchfile)],check=True)
+              for target in expected_files:
+                  dst = root / target
+                  dst.parent.mkdir(parents=True, exist_ok=True)
+                  dst.write_bytes(z.read('files/' + target))
+              print(f'Applied {manifest["id"]}: {len(expected_files)} new files and {len(changed)} source patches')
+          PY
+      - name: Run local checks (no GPU)
+        run: bash experiments/check_local.sh
+      - name: Commit only tested changes
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A -- experiments/ llm/b200/megakernel/ofa.cu llm/b200/megakernel/decode_wide.cuh llm/b200/megakernel/safe_limits.hpp
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'No changes'; exit 1; }
+          git commit -m 'OFA overlay 001: safety, B200 autobench, CPU tests'
+          git push origin HEAD:experiment/autobench
