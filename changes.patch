@@ -1,0 +1,53 @@
+diff --git a/llm/b200/megakernel/ofa.cu b/llm/b200/megakernel/ofa.cu
+--- a/llm/b200/megakernel/ofa.cu
++++ b/llm/b200/megakernel/ofa.cu
+@@ -48,6 +48,7 @@
+ #include "../../attention/attention.cuh"
+ #include "../../elementwise/ew_all.cuh"
+ #include "decode_wide.cuh"
++#include "safe_limits.hpp"
+ 
+ #include "doom_job.cuh"        // Doom job (device + host setup), see that header
+ #include "dashboard.cuh"       // HTTP dashboard server + sampler (host only)
+@@ -419,5 +420,9 @@
+     else if (!strcmp(argv[i], "--no-doom")) no_doom = true;
+     else if (!strcmp(argv[i], "--no-opt")) nopt = 1; else if (is("--opt-mode")) opt_mode = atoi(argv[++i]);
+   }
++  if (steps < 5) {
++    fprintf(stderr, "--steps must be at least 5 (required by steady-state reporting)\n");
++    return 2;
++  }
+   cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop, 0));
+   const int nsm = prop.multiProcessorCount;
+@@ -649,4 +654,8 @@
+   const int tps = prefix[nph];
+   printf("training graph: %d phases, %d tasks per step\n", nph, tps);
++  if (!ofa_limits::steps_safe(steps, tps, Bd.ntasks)) {
++    fprintf(stderr, "unsafe training steps=%d; scheduler permits at most %d for this graph\n", steps, ofa_limits::max_safe_steps(tps, Bd.ntasks));
++    return 2;
++  }
+ 
+   auto upload_job = [&](Builder& b, std::vector<int>& pre, int limit, int last, Job& J) {
+@@ -681,6 +690,11 @@
+       Dd.add("decode", d, {p - 1}, p == 0 ? std::vector<int2>{make_int2(DC::PHASES - 1, -1)} : std::vector<int2>{});
+     }
+     dprefix.assign(DC::PHASES + 1, 0); for (int i = 0; i < DC::PHASES; i++) dprefix[i + 1] = dprefix[i] + Dd.ntasks[i];
+-    upload_job(Dd, dprefix, 1 << 22, DC::PHASES - 1, C.dec);
++    const int decode_limit = ofa_limits::max_safe_steps(dprefix[DC::PHASES], Dd.ntasks, out_cap);
++    if (decode_limit <= 0) { fprintf(stderr, "invalid decode scheduler bounds\n"); return 2; }
++    if (decode_limit < (1 << 22)) {
++      printf("decode safety: cap %d tokens (was %d; 32-bit ticket, signed completion counters, output buffer)\n", decode_limit, 1 << 22);
++    }
++    upload_job(Dd, dprefix, decode_limit, DC::PHASES - 1, C.dec);
+     printf("decode job: %d phases, %d tasks per token; partition: infer SMs [0,%d), doom [%d,%d), train rest\n", DC::PHASES, dprefix[DC::PHASES], infer_sms, infer_sms, infer_sms + doom_sms);
+   }
+diff --git a/llm/b200/megakernel/decode_wide.cuh b/llm/b200/megakernel/decode_wide.cuh
+--- a/llm/b200/megakernel/decode_wide.cuh
++++ b/llm/b200/megakernel/decode_wide.cuh
+@@ -41,5 +41,6 @@
+   static_assert(DH == 64 && D_ == H_ * 64, "dh must be 64");
+   static_assert(D_ % 256 == 0 && D_ <= 2048, "D % 256 == 0, D <= 2048");   // widened from 1024 for config F (L=4, d=2048)
+   static_assert(V_ % HR_ == 0 && HR_ % 64 == 0, "V % HR");
++  static_assert(HR_ <= NTHREADS, "head tile cannot exceed the 256-thread candidate reduction");
+ };
+ using ModelS = Cfg<12, 768, 12, 512, 100352>;

@@ -1,0 +1,52 @@
+{
+  "id": "ofa-001",
+  "upstream_repository": "Bobliuuu/open-flapping-airplanes",
+  "upstream_branch": "main",
+  "expected_git_blobs": {
+    "llm/b200/megakernel/ofa.cu": "15f963e1edc76e9b1afcbe3cb1dd0fba2c940aff",
+    "llm/b200/megakernel/decode_wide.cuh": "6c285494affbef27cba446f5936115eb06b213b6"
+  },
+  "patch": {
+    "path": "changes.patch",
+    "sha256": "2ccb5838cecddf70285c087bc60d5c59752c325aab74a6ff8315ae0e8d05a4c8"
+  },
+  "files": [
+    {
+      "path": "experiments/README.md",
+      "sha256": "9ec7e8f593dedd9f414543ef30ff5fa3192379a8a94efdf863b492aaa2d8933d"
+    },
+    {
+      "path": "experiments/__init__.py",
+      "sha256": "714f6254d0b4c9510f6c12711fbe383ef0913ebe708988f3e7d79bd487e2e645"
+    },
+    {
+      "path": "experiments/analyze.py",
+      "sha256": "44d20d469839f6106f71dfd8edad891e157f9b1383a9f29229b2a3cf302142c9"
+    },
+    {
+      "path": "experiments/autobench.py",
+      "sha256": "6bb600e4f1c84dfa09a7ecfa15969a7765acf9c63981b51cdd2c3fe5b15c360f"
+    },
+    {
+      "path": "experiments/check_local.sh",
+      "sha256": "012bc26a8167e6e4249dec234303b65d4f7667d2ff140e179c443f7c614452db"
+    },
+    {
+      "path": "experiments/plan.py",
+      "sha256": "e9f296dab06dca7407e1eead6b68f4bf114eac5174b207b1f582e8e39c6edfbe"
+    },
+    {
+      "path": "experiments/tests/test_analyze.py",
+      "sha256": "5e2fd6ca97d231c0fa5426a0fc83bb11e59213cbb2ce97d7d5501295872ed569"
+    },
+    {
+      "path": "experiments/tests/test_limits.cpp",
+      "sha256": "c90559de669938eb581cd67b6e9efee9719cd80c505f09c5a75634d67110070c"
+    },
+    {
+      "path": "llm/b200/megakernel/safe_limits.hpp",
+      "sha256": "2132d1b96d199285eb5ca791c37701fe9b8cb028457ce43dd40c823c301e14c8"
+    }
+  ],
+  "notes": "CPU regression verified; CUDA/B200 builds not run here. Install the updated workflow separately first."
+}
