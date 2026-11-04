@@ -32,6 +32,13 @@ constexpr int NTHREADS = 256;
 #ifndef DECODE_HEAD_FUSED_ARGMAX
 #define DECODE_HEAD_FUSED_ARGMAX 1
 #endif
+// Overlay 005 C: compile-time independent switches.
+#ifndef DECODE_HEAD_SAMPLE_ONLY
+#define DECODE_HEAD_SAMPLE_ONLY 0
+#endif
+#ifndef DECODE_HEAD_WRITE_LOGITS
+#define DECODE_HEAD_WRITE_LOGITS 1
+#endif
 template <int L_, int D_, int H_, int T_, int V_, int HR_ = DECODE_HR>
 struct Cfg {
   static constexpr int L = L_, D = D_, H = H_, DH = 64, T = T_, V = V_, FF = 4 * D_;
@@ -43,7 +50,7 @@ struct Cfg {
   static_assert(DH == 64 && D_ == H_ * 64, "dh must be 64");
   static_assert(D_ % 256 == 0 && D_ <= 2048, "D % 256 == 0, D <= 2048");   // widened from 1024 for config F (L=4, d=2048)
   static_assert(V_ % HR_ == 0 && HR_ % 64 == 0, "V % HR");
-  static_assert(HR_ <= NTHREADS, "head tile cannot exceed the 256-thread candidate reduction");
+  static_assert(HR_ <= 512, "head tile currently supports up to two rows per thread");
 };
 using ModelS = Cfg<12, 768, 12, 512, 100352>;
 using ModelM = Cfg<16, 1024, 16, 512, 100352>;
@@ -588,6 +595,8 @@ __device__ __forceinline__ void task_head(const Params<C>& P, int t, char* smem)
   const float temp = P.temperature;
   const float invT = temp > 0.f ? 1.f / temp : 1.f;
   const uint32_t step = (uint32_t)__ldcg(&st->step);
+#if !DECODE_HEAD_SAMPLE_ONLY && DECODE_HEAD_WRITE_LOGITS && DECODE_HR <= 256
+  // Exact Candidate A implementation retained as the within-build baseline.
   float v0 = -INFINITY, v1 = -INFINITY;
   int gi = t * C::HR + tid;
   if (tid < C::HR) {
@@ -612,6 +621,52 @@ __device__ __forceinline__ void task_head(const Params<C>& P, int t, char* smem)
     st->cand_v[0][t] = b0; st->cand_i[0][t] = i0;
     st->cand_v[1][t] = b1; st->cand_i[1][t] = i1;
   }
+#else
+  // HR=512 assigns rows tid and tid+256 to each thread; each thread
+  // selects its own winner before the block-wide argmax. For the fast
+  // path, only the sampling mode actually consumed by task_sample is stored.
+  const int mode = temp > 0.f ? 1 : 0;
+  float b0 = -INFINITY, b1 = -INFINITY;
+  int i0 = 0x7fffffff, i1 = 0x7fffffff;
+#pragma unroll
+  for (int rep = 0; rep < (C::HR + NTHREADS - 1) / NTHREADS; ++rep) {
+    const int loc = tid + rep * NTHREADS;
+    if (loc < C::HR) {
+      const int gi = t * C::HR + loc;
+      const float l = lg[loc];
+#if DECODE_HEAD_WRITE_LOGITS
+      st->logits[gi] = l;
+#endif
+      if (gi < P.valid_vocab) {
+#if DECODE_HEAD_SAMPLE_ONLY
+        const float value = mode ? l * invT + gumbel(P.seed, step, gi) : l;
+        if (better(value, gi, b0, i0)) { b0 = value; i0 = gi; }
+#else
+        const float g = temp > 0.f ? l * invT + gumbel(P.seed, step, gi) : l;
+        if (better(l, gi, b0, i0)) { b0 = l; i0 = gi; }
+        if (better(g, gi, b1, i1)) { b1 = g; i1 = gi; }
+#endif
+      }
+    }
+  }
+#if DECODE_HEAD_SAMPLE_ONLY
+  block_argmax(b0, i0, sv, si);
+  if (tid == 0) {
+    st->cand_v[mode][t] = b0; st->cand_i[mode][t] = i0;
+  }
+#else
+#if DECODE_HEAD_FUSED_ARGMAX
+  block_argmax_pair(b0, i0, b1, i1, sv, si, scratch + 16, (int*)(scratch + 24));
+#else
+  block_argmax(b0, i0, sv, si);
+  block_argmax(b1, i1, sv, si);
+#endif
+  if (tid == 0) {
+    st->cand_v[0][t] = b0; st->cand_i[0][t] = i0;
+    st->cand_v[1][t] = b1; st->cand_i[1][t] = i1;
+  }
+#endif
+#endif
 }
 
 // xw := fixed point (wte[tok] + wpe[pos]); all 256 threads.

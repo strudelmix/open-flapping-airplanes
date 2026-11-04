@@ -113,6 +113,7 @@ struct Ctx {
   float lr_max, lr_min, beta1, beta2, eps, wd; int warmup, sched_steps;
   u64 *phase_busy, *phase_first, *phase_last; int prof_step;
   u64* decode_phase_busy; // optional, instrumentation perturbs throughput
+  u64 *decode_phase_first, *decode_phase_last; int decode_prof_token; // one-token low-overhead snapshot
   u64* step_done; float* loss_hist; u64* blk_busy; int* finished; u64* t_end;
   int infer_sms, doom_sms, train_sms, use_decode;
   const int* smid_rank;                                 // %smid -> dense SM rank (identity unless the probe found gaps)
@@ -305,6 +306,10 @@ __device__ void job_loop(const Ctx& C, const Job& J, int job_id, char* smem) {
       const u64 t1 = gtimer();
       busy += t1 - t0;
       if (job_id == 1 && C.decode_phase_busy) atomicAdd(C.decode_phase_busy + ph, t1 - t0);
+      if (job_id == 1 && step == C.decode_prof_token && C.decode_phase_first) {
+        atomicMin(C.decode_phase_first + ph, t0);
+        atomicMax(C.decode_phase_last + ph, t1);
+      }
       if (job_id == 0) {
         atomicAdd(C.phase_busy + ph, t1 - t0);
         if (step == C.prof_step) { atomicMin(C.phase_first + ph, t0); atomicMax(C.phase_last + ph, t1); }
@@ -408,6 +413,7 @@ int main(int argc, char** argv) {
   std::string data_path, init_path, starts_path, dump_grads, dump_w, loss_out, text_out, prompt_path; float temp = 0.8f; u64 seed = 1234; int dec_seed_steps = 1 << 20;
   int port = 0; std::string wad_path, vocab_path, prompt_text = "Once upon a time", index_path = "index.html"; bool no_doom = false, decode_profile = false;
   int decode_max_tokens = 1 << 26, decode_out_cap = 1 << 20;
+  int decode_prof_token = -1; // no snapshot unless explicitly requested
   int answer_len = 0;                                         // --answer-len N: ask the prompt again after every N sampled tokens
   double start_delay = 0;                                     // --start-delay S (with --port): wait S seconds before the launch
   for (int i = 1; i < argc; i++) {
@@ -424,6 +430,7 @@ int main(int argc, char** argv) {
     else if (is("--answer-len")) answer_len = atoi(argv[++i]); else if (is("--start-delay")) start_delay = atof(argv[++i]);
     else if (is("--decode-max-tokens")) decode_max_tokens = atoi(argv[++i]); else if (is("--decode-out-cap")) decode_out_cap = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--decode-profile")) decode_profile = true;
+    else if (is("--decode-prof-token")) decode_prof_token = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-doom")) no_doom = true;
     else if (!strcmp(argv[i], "--no-opt")) nopt = 1; else if (is("--opt-mode")) opt_mode = atoi(argv[++i]);
   }
@@ -730,6 +737,13 @@ int main(int argc, char** argv) {
   C.infer_sms = infer_sms; C.doom_sms = doom_sms; C.train_sms = train_sms_arg; C.use_decode = use_decode; C.smid_rank = d_rank;
   C.dm.finished = C.finished;
   C.decode_phase_busy = (use_decode && decode_profile) ? dalloc<u64>(DC::PHASES) : nullptr;
+  C.decode_prof_token = decode_prof_token;
+  C.decode_phase_first = (use_decode && decode_prof_token >= 0) ? dalloc<u64>(DC::PHASES) : nullptr;
+  C.decode_phase_last = (use_decode && decode_prof_token >= 0) ? dalloc<u64>(DC::PHASES) : nullptr;
+  if (C.decode_phase_first) {
+    std::vector<u64> init(DC::PHASES, ~0ull);
+    CK(cudaMemcpy(C.decode_phase_first, init.data(), init.size() * sizeof(u64), cudaMemcpyHostToDevice));
+  }
   CK(cudaDeviceSynchronize());
 
   // ---------------- run: ONE launch
@@ -814,6 +828,31 @@ int main(int argc, char** argv) {
              answer_count, (int)forced.size(), answer_len, sampled_count, sampled_count / ((double)(sd[steps - 1] - sd[0]) * 1e-9 + 1e-9));
     }
     printf("first sampled token ids:"); for (int tok : first_tokens) printf(" %d", tok); printf("\n");
+  }
+  if (use_decode && C.decode_phase_first) {
+    std::vector<u64> first(DC::PHASES), last(DC::PHASES);
+    CK(cudaMemcpy(first.data(), C.decode_phase_first, DC::PHASES * sizeof(u64), cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(last.data(), C.decode_phase_last, DC::PHASES * sizeof(u64), cudaMemcpyDeviceToHost));
+    u64 previous_end = 0, first_begin = 0;
+    double sum_us = 0.0, gap_us = 0.0;
+    bool complete = true;
+    for (int ph = 0; ph < DC::PHASES; ++ph) {
+      if (first[ph] == ~0ull || last[ph] < first[ph]) { complete = false; break; }
+      const char* kind = ph < 3 * L ?
+          ((ph % 3 == 0) ? "QKV" : (ph % 3 == 1) ? "ATTWO" : "UPDN") :
+          (ph == 3 * L ? "LM_HEAD" : "SAMPLE");
+      const double span = (last[ph] - first[ph]) * 1e-3;
+      const double gap = previous_end ? ((double)((long long)first[ph] - (long long)previous_end) * 1e-3) : 0.0;
+      if (!ph) first_begin = first[ph];
+      printf("decode phase wall: ph=%d kind=%s tasks=%d span_us=%.3f gap_us=%.3f\n",
+             ph, kind, decode::phase_tasks<DC>(ph), span, gap);
+      sum_us += span; gap_us += gap;
+      previous_end = last[ph];
+    }
+    if (complete)
+      printf("decode phase snapshot: token=%d whole_us=%.3f spans_us=%.3f gaps_us=%.3f\n",
+             decode_prof_token, (last.back() - first_begin) * 1e-3, sum_us, gap_us);
+    else printf("decode phase snapshot: INCOMPLETE token=%d\n", decode_prof_token);
   }
   if (use_decode && C.decode_phase_busy) {
     std::vector<u64> phase(DC::PHASES);
