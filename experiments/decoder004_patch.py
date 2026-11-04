@@ -52,14 +52,14 @@ def apply_ofa(src: str) -> str:
         '        const bool claimed = job_id == 1 ? atomicCAS(J.ticket64, g, g + 1ull) == g\n'
         '                                         : (u64)atomicCAS(const_cast<unsigned*>(J.ticket), (unsigned)g, (unsigned)(g + 1)) == g;\n'
         '        if (claimed) { local = r - __ldg(J.prefix + ph); break; }')
-    many('              const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);\n'
-         '              if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;',
-         '              const u64 need = (u64)__ldg(J.ntasks + e.x) * (u64)(step + 1 + e.y);\n'
-         '              if (need > 0 && (job_id == 1 ? ld_acq(J.done64 + e.x) : (u64)ld_acq(J.done + e.x)) < need) ready = false;', 1)
-    many('            const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);\n'
-         '            if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;',
-         '            const u64 need = (u64)__ldg(J.ntasks + e.x) * (u64)(step + 1 + e.y);\n'
-         '            if (need > 0 && (job_id == 1 ? ld_acq(J.done64 + e.x) : (u64)ld_acq(J.done + e.x)) < need) ready = false;', 1)
+    one('              const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);\n'
+        '                if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;',
+        '              const u64 need = (u64)__ldg(J.ntasks + e.x) * (u64)(step + 1 + e.y);\n'
+        '                if (need > 0 && (job_id == 1 ? ld_acq(J.done64 + e.x) : (u64)ld_acq(J.done + e.x)) < need) ready = false;')
+    one('            const int need = __ldg(J.ntasks + e.x) * (step + 1 + e.y);\n'
+        '            if (need > 0 && ld_acq(J.done + e.x) < need) ready = false;',
+        '            const u64 need = (u64)__ldg(J.ntasks + e.x) * (u64)(step + 1 + e.y);\n'
+        '            if (need > 0 && (job_id == 1 ? ld_acq(J.done64 + e.x) : (u64)ld_acq(J.done + e.x)) < need) ready = false;')
     one('      busy += t1 - t0;\n      if (job_id == 0) {',
         '      busy += t1 - t0;\n'
         '      if (job_id == 1 && C.decode_phase_busy) atomicAdd(C.decode_phase_busy + ph, t1 - t0);\n'

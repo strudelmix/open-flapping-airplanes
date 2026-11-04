@@ -26,7 +26,7 @@ constexpr int GW = 320, GH = 200, RT = 5, TPG = 1 + RT, FBSZ = GW * GH + 1024;  
 constexpr long long FRAME_NS = 28571429ll;                                          // Doom runs at 35 Hz
 constexpr int DOOM_MAX_FRAMES = 1 << 17;
 
-struct Live { volatile unsigned frames, steps; volatile float loss; };               // pinned, host-visible counters
+struct Live { volatile unsigned frames, steps; volatile float loss; volatile u64 decode_tokens; };               // pinned, host-visible counters
 
 struct DoomCtx {
   int on; int* dctr; unsigned* ticket; u64* epoch; u64* frame_done; unsigned char* fb; Live* live; const int* finished;

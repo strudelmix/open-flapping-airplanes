@@ -608,13 +608,13 @@ __device__ __forceinline__ void task_sample(const Params<C>& P, char* smem) {
       int astep = st->astep;
       const bool forcing = astep + 1 < P.nforced;
       if (forcing) next = P.forced[astep + 1];
-      if (st->out_tokens && step < st->out_cap) st->out_tokens[step] = forcing ? (astep == 0 ? OUT_RESTART : OUT_FORCED) : bi;
+      if (st->out_tokens && st->out_cap > 0) st->out_tokens[step % st->out_cap] = forcing ? (astep == 0 ? OUT_RESTART : OUT_FORCED) : bi;
       pos += 1; astep += 1;
       if (astep >= P.nforced - 1 + P.answer_len) { next = P.forced[0]; pos = 0; astep = 0; }   // answer done: ask again
       st->astep = astep;
     } else {
       if (step + 1 < P.nforced) next = P.forced[step + 1];
-      if (st->out_tokens && step < st->out_cap) st->out_tokens[step] = bi;
+      if (st->out_tokens && st->out_cap > 0) st->out_tokens[step % st->out_cap] = bi;
       pos += 1;
     }
     st->ctx_full = (pos >= C::T);
