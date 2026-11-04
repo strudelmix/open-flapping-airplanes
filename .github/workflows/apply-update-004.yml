@@ -1,0 +1,107 @@
+name: Apply OFA update 004 (decoder endurance)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ofa-overlay-experiment-autobench
+      cancel-in-progress: false
+    steps:
+      - name: Check out experiment/autobench (never main)
+        uses: actions/checkout@v4
+        with:
+          ref: experiment/autobench
+          persist-credentials: true
+
+      - name: Verify Overlay 004 and copy only exact files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, pathlib, stat, subprocess, sys, zipfile
+          root = pathlib.Path.cwd().resolve()
+          source = root / 'updates/ofa-update-004.zip'
+          if not source.is_file() or source.is_symlink():
+              sys.exit('Upload ZIP to experiment/autobench at updates/ofa-update-004.zip')
+          if subprocess.check_output(['git', 'status', '--porcelain'], text=True).strip():
+              sys.exit('Refusing to modify dirty checkout')
+          sha = lambda data: hashlib.sha256(data).hexdigest()
+          base = root / 'experiments/autobench.py'
+          # Do not apply to a branch where Overlay 003 changed the benchmark.
+          required_base = '0a2dfec696345468da62b5c326dabb379f77e147d658af823d67430f69ddf5bc'
+          if not base.is_file() or sha(base.read_bytes()) != required_base:
+              sys.exit('Expected working Overlay 002 (not 003). Existing autobench.py differs; no files changed.')
+          srcdir = root / 'llm/b200/megakernel'
+          inputs = [srcdir / x for x in ('ofa.cu','decode_wide.cuh','doom_job.cuh')]
+          if any(not f.is_file() or f.is_symlink() for f in inputs):
+              sys.exit('CUDA source missing or symlinked; no files changed')
+          if ('#include "safe_limits.hpp"' not in inputs[0].read_text()
+                  or 'const int decode_limit = ofa_limits::max_safe_steps' not in inputs[0].read_text()
+                  or 'static_assert(HR_ <= NTHREADS' not in inputs[1].read_text()):
+              sys.exit('Expected Overlay 001 CUDA guards not found; no files changed')
+          expected = {
+              'experiments/decoder004_patch.py',
+              'experiments/endurance.py',
+              'experiments/tests/test_decoder_004.py',
+              'experiments/OVERLAY-004.md',
+          }
+          expected_script_sha = '695c28a41aac6122919eb3c8b8f587c39205d3ffd9fbf3167dd8cb93d70dceda'
+          with zipfile.ZipFile(source) as z:
+              infos = z.infolist()
+              if len(infos) != len(expected) + 1 or sum(x.file_size for x in infos) > 220000:
+                  sys.exit('Unexpected ZIP size / entry count')
+              names = [x.filename for x in infos]
+              if len(names) != len(set(names)) or set(names) != {'manifest.json'} | {'files/' + p for p in expected}:
+                  sys.exit('ZIP has missing, extra or duplicate entries')
+              for info in infos:
+                  p = pathlib.PurePosixPath(info.filename)
+                  if (info.is_dir() or p.is_absolute() or '..' in p.parts or '\\' in info.filename
+                          or '\x00' in info.filename or stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK
+                          or info.file_size > 100000):
+                      sys.exit('Unsafe ZIP entry ' + info.filename)
+              m = json.loads(z.read('manifest.json'))
+              if m.get('id') != 'ofa-004' or m.get('upstream_repository') != 'Bobliuuu/open-flapping-airplanes':
+                  sys.exit('Wrong update ID or repository')
+              if m.get('baseline_autobench_sha256') != required_base:
+                  sys.exit('Overlay 002 base hash does not match')
+              add = m.get('add_files')
+              if not isinstance(add, list) or len(add) != len(expected) or {x['path'] for x in add} != expected:
+                  sys.exit('Wrong added-files manifest')
+              if sha(z.read('files/experiments/decoder004_patch.py')) != expected_script_sha:
+                  sys.exit('Installer patch script is not the expected reviewed version')
+              for record in add:
+                  dest = root / record['path']
+                  if any(x.is_symlink() for x in (dest, *[a for a in dest.parents if a != root and root in a.parents])):
+                      sys.exit('Symlink in target ' + record['path'])
+                  if dest.exists():
+                      sys.exit('Destination exists: ' + record['path'])
+                  if sha(z.read('files/' + record['path'])) != record.get('sha256'):
+                      sys.exit('Checksum mismatch: ' + record['path'])
+              for record in add:
+                  dest = root / record['path']
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  dest.write_bytes(z.read('files/' + record['path']))
+          print('Overlay 004 verified and staged. CUDA edits are strict anchored transformations.')
+          PY
+
+      - name: Apply decoder-only CUDA changes (no training scheduler changes)
+        run: python3 experiments/decoder004_patch.py
+
+      - name: Run CPU regression and source-guard tests (no GPU)
+        run: bash experiments/check_local.sh
+
+      - name: Commit only Overlay 004 files to experimental branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- llm/b200/megakernel/ofa.cu llm/b200/megakernel/decode_wide.cuh llm/b200/megakernel/doom_job.cuh experiments/decoder004_patch.py experiments/endurance.py experiments/tests/test_decoder_004.py experiments/OVERLAY-004.md
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'Nothing to commit'; exit 1; }
+          git commit -m 'OFA overlay 004: decoder endurance and opt-in phase profiling'
+          git push origin HEAD:experiment/autobench
