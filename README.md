@@ -1,268 +1,54 @@
-<div align="center">
+# Overlay 005 C — reproducible LM_HEAD optimization experiment
 
-<img src="site/assets/hero.svg" alt="open-flapping-airplanes: one kernel, three programs" width="100%">
+**Base:** Candidate A, `experiment/overlay005-head-fused-argmax-v1`, commit `8107269`.
 
-# open-flapping-airplanes
+## Goals
 
-**One persistent GPU kernel that trains a language model, serves it live, and plays Doom, all at the same time.**
+- Preserve A256 exact code as within-build baseline.
+- Test four variants, compiled with the same CUDA 12.8.1, `sm_100a`, tcgen05 stages=2 flags:
+  - `a256`: HR=256, fused double argmax, writes logits (Candidate A).
+  - `tile512`: HR=512, fused double argmax, writes logits (tile effect alone).
+  - `fast256`: HR=256, only active sampler argmax, no full-logit write.
+  - `fast512`: HR=512, only active sampler argmax, no full-logit write.
+- Add optional **single-token phase wall snapshots**: min start / max end per phase for token 2048, with transition gap. This instruments one token; unlike `--decode-profile`, it does not add an atomic to every decode task for every step. Any timing instrument still has some overhead; compare variants identically.
+- Verify fixed-weight token equality (`--no-opt`) against A256, then compare concurrent **training + decoder + Doom**, all on a single B200 sequentially.
 
-![GPU](https://img.shields.io/badge/GPU-A100%20%C2%B7%20B200%20%C2%B7%20B300-76b900?logo=nvidia&logoColor=white) ![launches](https://img.shields.io/badge/kernel%20launches%20for%20the%20run-1-27c8e8) ![doom](https://img.shields.io/badge/Doom-35%20fps%20on%20the%20GPU-f2c14e) ![status](https://img.shields.io/badge/status-research%20demo-lightgrey)
+## Codespaces installation
 
-[📊 Results](#results) · [🧩 Architecture](#architecture) · [✈️ Compared with Flapping Airplanes](#how-it-compares-to-flapping-airplanes) · [🚀 Quick start](#quick-start) · [Repo map](#repo-map) · [Limitations](#limitations) · [🎬 Videos](#videos)
-
-</div>
-
----
-
-Flapping Airplanes showed a demo video of one GPU kernel that trains a model, serves it, and plays Doom at the same time. We rebuilt it from that video, in the open.
-It is a real persistent megakernel: **one launch, and its blocks never exit.** They pull training, serving and Doom tasks from on-GPU queues
-until the run ends. We never saw their code; everything here was written from scratch, and every number comes from a result file in this repo.
-
-**Live demo (94 s):** our run on one B200, in Flapping Airplanes' format, with their demo next to ours at the same moment of each run.
-
-https://github.com/user-attachments/assets/97e664f5-5b6b-43c1-978b-eb30530e9565
-
-**Explainer (98 s):** the problem, the idea, the Doom port, the method, and the results against Flapping Airplanes' published numbers.
-
-https://github.com/user-attachments/assets/239f7d26-4d33-4623-b42c-94647baa15bb
-
-## What It Does
-
-Built by Jerry Zhu from Shopify and Arnold Xu from [Magni](https://magnihq.com): Magni uses AI agents to push GPUs closer to their physical limits usin near silicon inference. 
-
-| | Program | What happens |
-|---|---|---|
-| Train | **Training** | A GPT learns online: forward, backward and AdamW all run as tasks inside the kernel. |
-| Serve | **Inference** | Text streams out of the live, still-training weights, so the output improves while the loss falls. |
-| Play | **Doom** | The real engine (doomgeneric, shareware E1M1) runs its own game loop on the GPU at 35 fps, played by a scripted player. |
-
-<div align="center">
-
-![Live dashboard: training loss, streaming text, Doom](site/assets/dashboard.png)
-
-</div>
-
-## Results
-
-### Headline: LLM scale on one NVIDIA B200 (Modal `gpu="B200"`, 148 SMs)
-
-162.4M-parameter GPT ("S"), 4,000 steps of 4,096 tokens, final loss 2.1575. Split: 116 SMs train, 24 serve, 8 run Doom. Serving uses Flapping
-Airplanes' prompt "What is a megakernel?". Baselines run alone on the same SM shares (CUDA MPS). Source: [`b200-run/README.md`](b200-run/README.md).
-
-| System | 4,000 training steps | Serving | Doom |
-|---|---|---|---|
-| **open-flapping-airplanes, `tcgen05` GEMMs, 3 stages** (`ofa_tc3`) | **48.1 s** | **1,660 tok/s** | 35 fps |
-| **open-flapping-airplanes, `tcgen05` GEMMs, 2 stages** (`ofa_tc2`) | **52.4 s** | **1,741 tok/s** | 35 fps |
-| open-flapping-airplanes, `mma.sync` GEMMs (`ofa_s`, first build) | 95.8 s | 1,783 tok/s | 35 fps |
-| Megatron-core + Transformer Engine, eager, 116 SMs | 62.4 s | - | - |
-| **Megatron-core + Transformer Engine, CUDA graphs, 116 SMs** | **43.1 s** | - | - |
-| PyTorch + flash attention, one CUDA graph per step, 116 SMs | 50.9 s | - | - |
-| vLLM 0.33.0, CUDA graphs, 24 SMs, 16 reserved CPU cores | - | 1,537 tok/s | - |
-
-Megatron + Transformer Engine with CUDA graphs trains faster than both of our builds on this GPU (43.1 s against 48.1 s and 52.4 s). Eager
-Megatron is slower than us, and vLLM serves slower than us.
-
-<p align="center">
-<img src="site/assets/1_training.png" alt="Training time on 116 SMs, B200" width="49%">
-<img src="site/assets/2_serving.png" alt="Serving tokens per second on 24 SMs, B200" width="49%">
-</p>
-<p align="center">
-<img src="site/assets/3_sharing.png" alt="One kernel vs sequential vs side by side" width="60%">
-</p>
-
-Red bars are numbers read from Flapping Airplanes' video; everything else was measured here. Charts are generated by [`tools/make_b200_charts.py`](tools/make_b200_charts.py) (run it from `site/assets/`).
-
-### Same GPT on one NVIDIA A100 (108 SMs, 85 / 17 / 6 split)
-
-| System | 4,000 steps | Throughput | Serving | Doom |
-|---|---|---|---|---|
-| **open-flapping-airplanes, `llm/ofa_fast`** (best A100 build, real Doom on) | **190.7 s** | 85.9k tok/s | 591 tok/s | 35 fps |
-| Megatron-core + Transformer Engine, restricted to 84 SMs, alone | 233.2 s | - | - | - |
-| PyTorch eager, 84 SMs, alone | 226.2 s | - | - | - |
-
-`ofa_fast` is 1.22x faster than the Megatron + TE baseline and 1.19x faster than eager PyTorch, with the same loss (2.1490) as the Doom-free
-build. It merges Doom's PTX into the kernel's PTX so the Doom build avoids the relocatable-code slowdown (224 s with `-rdc`, 190.7 s merged);
-see [`llm/ofa_fast/README.md`](llm/ofa_fast/README.md) and [`llm/baseline/README.md`](llm/baseline/README.md).
-
-### Same GPT on an NVIDIA B300 (clearly not a B200)
-
-Modal `gpu="B300"` (SXM6, compute capability 10.3, 148 SMs), Doom compiled out, `tcgen05` megakernel: **49.9 s** for 4,000 steps on the 116 / 24 / 8
-split (40.1 s training-only on all SMs), serving about 1,080 tok/s. Baselines there had no Transformer Engine: PyTorch eager on 116 SMs 55.9 s,
-Megatron-core without TE 136.6 s. Data: [`b300-run/`](b300-run/README.md), report [`B300_ROUND2.md`](b300-run/B300_ROUND2.md).
-**These are B300 measurements, not B200**; the folder name comes from a Modal `B200+` request that can land on either chip.
-
-### The small demo (115k-parameter char model, A100 and B200)
-
-The original demo is a tiny model whose step lasts about 56 microseconds. There, the same task code launched as ordinary per-op kernels is faster
-per job (13-25% faster at training); the megakernel's advantage is running all three jobs at once: two processes sharing the GPU are 45-49% slower
-on the A100 and 42-58% slower on the B200. Numbers: [`benchmarks/results/`](benchmarks/results/) and the [stats site](site/).
-
-| Demo, all three at once | Train steps/s | Infer tok/s | Doom fps | Launches |
-|---|---|---|---|---|
-| A100-SXM4-40GB | 13,507.6 | 53,211.6 | 35.0 | 1 |
-| B200 | 17,788.6 | 71,349.9 | 35.0 | 1 |
-
-## Architecture
-
-Every block of the kernel is a long-lived worker. At start each block reads its SM id and takes a role from a static partition (B200: 24 SMs
-serve, 8 run Doom, 116 train). Inside the training and serving jobs, thread 0 of a block claims the next task from one ticket counter with a
-single `atomicAdd` (no locks, no CAS retry loop) and the whole block runs it. Each task belongs to a phase, and each phase has a completion
-counter. When a task finishes, the block does a `__threadfence` and then an `atomicAdd` on its phase's counter. Before it starts a task, thread 0
-reads the counters of the phases it depends on with acquire loads and sleeps (`__nanosleep`) until they reach the target. So a forward pass
-releases its backward pass and a token releases the next token, with no kernel launch in between. Tickets are handed out in dependency order, so
-a block waiting on its inputs can never deadlock: the lowest unfinished ticket always has its dependencies done.
-
-```mermaid
-flowchart TB
-    H["host: ONE launch"] --> K
-    subgraph K["persistent megakernel (all SMs)"]
-        direction TB
-        S["each block reads its SM id: static role<br/>no preemption, no host in the loop"]
-        subgraph P["SM partition (B200: 116 / 24 / 8)"]
-            direction LR
-            T["116 SMs<br/>training tasks<br/>fwd, bwd, AdamW"]
-            I["24 SMs<br/>decode tasks<br/>read live weights"]
-            D["8 SMs<br/>Doom engine<br/>35 fps"]
-        end
-        S --> P
-        C["one ticket counter per job + one completion counter per phase<br/>in global memory"]
-        P <--> C
-    end
-    K --> W["pinned memory + HTTP"] --> B["browser: loss, streaming text, Doom frame"]
-```
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant T as thread 0 of a block
-    participant Q as ticket counter
-    participant C as phase counters
-    participant W as all threads of the block
-    loop persistent loop, inside ONE launch
-        T->>Q: atomicAdd(ticket), get the next task
-        T->>C: acquire-load the counters of the phases it depends on
-        C-->>T: counter >= target (else __nanosleep and retry)
-        T->>W: run the task (registers, shared memory, L2)
-        W->>C: __threadfence, then atomicAdd(phase counter)
-    end
-```
-
-(The small demo, `a100-demo/`, uses a different scheduler: sharded ticket queues with a CAS claim and Doom > serve > train priority.)
-
-On Blackwell the GEMMs use `tcgen05` instructions with TMA loads and TMEM accumulators ([`llm/b200/gemm_tcgen05/`](llm/b200/gemm_tcgen05/README.md)),
-34-73% of cuBLAS speed on the model's 15 GEMM shapes against 13-33% for the earlier `mma.sync` code.
-
-**How Doom runs on a GPU.** doomgeneric is compiled with clang's NVPTX backend against a small hand-written tinylibc. clang 14 cannot select
-`va_start` for NVPTX, so `fix_varargs.py` lowers varargs at the LLVM IR level; `build_doom.sh` patches static initialisers PTX cannot express, and
-sound is disabled. Thread 0 runs the game logic and queues column and span draws; the other 255 threads of the block execute the queue behind a
-named barrier, which takes a frame from 24 ms to 6.7 ms with a pixel-identical picture.
-
-```mermaid
-flowchart LR
-    A[doomgeneric C source] -->|clang -target nvptx64| B[LLVM bitcode]
-    T[tinylibc.c] --> B
-    B -->|llvm-link| C[one module]
-    C -->|fix_varargs.py| D[patched IR]
-    D -->|llc| E[PTX]
-    E -->|nvcc, or merged into the kernel PTX| F[device code]
-    G[megakernel .cu] --> H((binary))
-    F --> H
-```
-
-## How it compares to Flapping Airplanes
-
-Their column is read frame by frame from their demo video ([`benchmarks/fa_published.json`](benchmarks/fa_published.json)); we did not measure it.
-Ours is the B200 run above (same chip, same 116 / 24 / 8 split, Megatron + Transformer Engine and vLLM as baselines, a 162M-parameter GPT; their
-model size, data and settings are unpublished). "Slower" is FA's metric, 1 - baseline rate / megakernel rate.
-
-| | Flapping Airplanes (B200, video) | Ours, `tcgen05` 3 stages (`ofa_tc3`) | Ours, `tcgen05` 2 stages (`ofa_tc2`) |
-|---|---|---|---|
-| 4,000 steps, megakernel | 46.1 s | 48.1 s | 52.4 s |
-| Serving "What is a megakernel?" | 1,076 tok/s | 1,660 tok/s | 1,741 tok/s |
-| vs Megatron + TE, eager | 70.1 s: baseline **34% slower** | 62.4 s: baseline **23% slower** | 62.4 s: baseline **16% slower** |
-| vs Megatron + TE, CUDA graphs | not reported | 43.1 s: baseline **11.5% faster** | 43.1 s: baseline **21.5% faster** |
-| vs vLLM serving | 710 tok/s: baseline **34% slower** | 1,537 tok/s: baseline **7% slower** | 1,537 tok/s: baseline **12% slower** |
-| Kernel launches | 1 vs 514,562 | 1 vs 2.2M-4.2M host launch calls (15.2M kernels) | same |
-| Doom | plays throughout | 35 fps throughout | 35 fps throughout |
-
-- **Launches.** For the same work (4,000 steps plus about 91,000 served tokens) the baselines make 2.2M to 15.2M launches depending on how they are
-  counted (host launch calls with CUDA graphs versus every kernel on the GPU). Nsight Systems counts **3** launches for a whole `ofa_tc2` process: two one-off setup kernels
-  and the megakernel, which runs all training, serving and Doom ([`b200-run/results/launches_ofa_tc2/`](b200-run/results/launches_ofa_tc2/nsys_launches.json)).
-- **Training.** We beat Megatron + TE as frameworks run by default (eager), by 16-23% against their 34%. Megatron + TE with CUDA graphs is faster than
-  we are: 43.1 s against 48.1 s and 52.4 s. We do not know whether their baseline used graphs.
-- **Serving.** vLLM at batch 1 is bound by its CPU. With 16 reserved cores it made 1,537 tok/s; in a container without them 684 tok/s, close to FA's 710.
-  We compare against the faster figure, which favours the baseline.
-- **Doing all three at once saves time, mostly because the GPU is shared.** Same work, one B200: sequential Megatron (graphs) then vLLM about 102 s;
-  the two side by side on their SM shares about 59 s (estimated from separate runs); one megakernel 52.4 s (measured).
-
-More rows (PyTorch, no-TE Megatron, the A100 and B300 runs, the toy demo) are in [`docs/FA_COMPARISON.md`](docs/FA_COMPARISON.md).
-
-## Quick start
-
-You need either an NVIDIA A100 box reachable over SSH, or a [Modal](https://modal.com) account for a B200. The shareware `doom1.wad` is not in this
-repo; the setup scripts download it and keep it only if its md5 matches.
-
-**A100 (SSH box):**
+Upload / unzip the package somewhere in the repository worktree, then:
 
 ```bash
-./doom-gpu/setup_box.sh ubuntu@<ip>              # once: clang, doomgeneric, shareware WAD (md5 checked)
-./a100-demo/run_demo.sh ubuntu@<ip>              # the small demo, tunnelled to http://localhost:8080
-MODEL=S ./llm/ofa_fast/run_ofa.sh ubuntu@<ip> 8080   # the 162M GPT: train + serve + Doom, one launch
-./benchmarks/run_benchmarks.sh ubuntu@<ip> 5 6   # small-demo benchmark, writes benchmarks/results/
-python3 -m http.server 8000 --directory site     # the stats site, http://localhost:8000
+cd /workspaces/open-flapping-airplanes
+bash ./ofa_overlay005c/install.sh
+cd /workspaces/open-flapping-airplanes-c
 ```
 
-**B200 (Modal, no SSH):**
+The installer **does not modify Candidate B**, even if B has uncommitted files: it uses `git worktree add` to create a sibling checkout based on the remote Candidate A branch, applies two strict-anchored edits, copies the benchmark script, checks CPU tests (including a new tile-routing simulation), and commits Candidate C locally. It does *not* push automatically.
+
+## Execution
+
+First (no GPU):
 
 ```bash
-uv tool install modal && modal setup             # once
-modal run b200-run/modal_app.py --step <prep|env|mk|tccmp|train|serve|gemm|report>    # LLM-scale comparison, see b200-run/README.md
-modal run benchmarks/run_modal.py --mode bench   # the small demo on one B200 (about 7 GPU-minutes)
+modal run experiments/overlay005c_bench.py --mode build
 ```
 
-Modal runs cost money (a B200 is billed per second); read `b200-run/README.md` before running the full comparison.
+After build passes, this is **paid B200** (one GPU allocation, four fixed-weight correctness runs, then four performance runs, sequential; no automatic retries):
 
-## Repo map
+```bash
+modal run experiments/overlay005c_bench.py --mode all --steps 4000 --run-id overlay005c-ab1
+```
 
-| Path | What |
-|---|---|
-| `b200-run/` | The LLM-scale comparison on a real B200 against Megatron + TE and vLLM: `modal_app.py`, `results/` |
-| `llm/` | LLM megakernel work: `ofa_fast/` (best A100 build), `ofa/` (rdc Doom build), `megakernel/` (Doom-free), `gemm/`, `gemm2/`, `attention/`, `decode/`, `baseline/` (Megatron, PyTorch, vLLM on A100), `b200/` (Blackwell kit: `tcgen05` GEMMs, megakernel, Modal drivers) |
-| `b300-run/` | **B300** runs on Modal (`gpu="B300"`): reports, logs, raw results |
-| `a100-demo/` | The small-model demo: `demo.cu` megakernel with an HTTP server, three-panel dashboard |
-| `doom-gpu/` | Compiling Doom for the GPU: tinylibc, `fix_varargs.py`, `build_doom.sh`, `setup_box.sh`; `player/` is the scripted player |
-| `benchmarks/` | Small-demo benchmarks: `run_benchmarks.sh` (SSH), `run_modal.py` (Modal), `compare.py`, `fa_published.json`, `results/` |
-| `site/` | Static stats website (`index.html`, `data/`, `assets/`) |
-| `video/` | Sources of the explainer video and of the B200 demo video |
-| `tools/` | `gen_svgs.py` regenerates the animated SVGs |
-| `docs/` | `FA_COMPARISON.md` (every run next to FA's numbers), `RESEARCH.md` (research log), `REORG_PLAN.md` (a folder regrouping that is not done) |
+Additional modes `--mode verify` (frozen-weight only) and `--mode compare` (training performance only) are available but each allocates a new B200. `all` keeps all stages in one allocation and will stop before performance runs if equivalence fails. For short dry runs use `--steps 1000` but compare with **matched** workloads, not older 4,000-step results.
 
-## Limitations
+The command prints a summary. Artifacts including `summary.json`, `run.log`, `tokens.txt`, `loss.txt` for each run are persisted to the `ofa-b200-data` Modal volume under `/vol/results/ofa_overlay005c/<run_id>/`. For example:
 
-- **Not their code or model.** Same chip, SM split and baselines as the Flapping Airplanes video, but their model, data and training settings are unpublished. We do not reproduce their 46.1 s (our fastest is 48.1 s) or their trained answers (ours is trained on TinyStories).
-- **Megatron + TE with CUDA graphs still trains faster than us on the B200** (43.1 s against 48.1 s).
+```bash
+modal volume get ofa-b200-data /results/ofa_overlay005c/overlay005c-ab1/summary.json ./overlay005c-summary.json
+```
 
-## Videos
+`--no-opt` leaves model weights fixed, so the first **8,192 token IDs**, including markers, must agree for all variants. The performance runs use live training, so their token sequences are **not** required to match. Each performance run checks training loss curve vs A256 (maximum difference <=0.01), at least 33 Doom FPS, a working token ring, and per-token snapshot completeness.
 
-### Live demo (94 s, plays at the top of this README)
+Promotion criterion: Candidate C must exceed ~**1,946 decoder tok/s**, preserve training throughput to within 1% of same-batch A256, preserve Doom at >=33 FPS, and pass frozen-weight equality. Treat small measured differences as run-to-run noise until repeated.
 
-Our run on one B200, in Flapping Airplanes' format: the recorded live dashboard (training loss, streaming text, Doom), the code, the split, the side
-by side with the baselines, the result cards, and Flapping Airplanes' demo next to ours at the same moment of each run, with music. Every number
-comes from `b200-run/results/` and `benchmarks/fa_published.json` through `video/b200/make_data.py`; their footage is from their demo video.
-
-### Explainer (98 s, plays at the top of this README)
-
-The problem (launch counts), the idea (one persistent kernel, the 116 / 24 / 8 SM split), the Doom port, the method, a still of the B200 dashboard,
-and the results against Flapping Airplanes' published numbers, all on one B200. It is rendered from [`video/data.json`](video/data.json), whose
-values come from `b200-run/results/` and `benchmarks/fa_published.json`, not typed into the scenes.
-
-Sources are in [`video/`](video/README.md). Full-quality copies are in `video/release/`; GitHub's file view does not play files this large, so
-download them to watch.
-
-## Credits and licensing
-
-- Independent rebuild, **not affiliated with, endorsed by, or based on code from Flapping Airplanes**. Their numbers come from their public video.
-- **doomgeneric** by ozkl is GPL-licensed; `setup_box.sh` clones it and it is not stored in this repo. **Doom** is by id Software.
-- The **shareware `doom1.wad` is not included**; the setup script downloads it and checks its md5.
-- The code in this repo is released under the [MIT License](LICENSE) (c) 2026 Jerry Zhu. It does not cover doomgeneric, Doom or the WAD, which keep their own licenses.
-- Background: [`docs/RESEARCH.md`](docs/RESEARCH.md), [`benchmarks/README.md`](benchmarks/README.md), [`site/README.md`](site/README.md).
+No claims of >5.6% have been established until measured. GPU resource costs apply to modes other than `build`.
