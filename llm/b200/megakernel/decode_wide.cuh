@@ -29,6 +29,9 @@ constexpr int NTHREADS = 256;
 #ifndef DECODE_HR
 #define DECODE_HR 128
 #endif
+#ifndef DECODE_HEAD_FUSED_ARGMAX
+#define DECODE_HEAD_FUSED_ARGMAX 1
+#endif
 template <int L_, int D_, int H_, int T_, int V_, int HR_ = DECODE_HR>
 struct Cfg {
   static constexpr int L = L_, D = D_, H = H_, DH = 64, T = T_, V = V_, FF = 4 * D_;
@@ -161,6 +164,36 @@ __device__ __forceinline__ void block_argmax(float& v, int& idx, float* sv, int*
   __syncthreads();
 }
 
+
+// Overlay 005: fuse two independent argmax reductions.
+// Comparison order and tie-breaking are preserved.
+__device__ __forceinline__ void block_argmax_pair(
+    float& a, int& ai, float& b, int& bi,
+    float* sva, int* sia, float* svb, int* sib) {
+  for (int o = 16; o; o >>= 1) {
+    float oa = __shfl_xor_sync(0xffffffffu, a, o);
+    int oai = __shfl_xor_sync(0xffffffffu, ai, o);
+    float ob = __shfl_xor_sync(0xffffffffu, b, o);
+    int obi = __shfl_xor_sync(0xffffffffu, bi, o);
+    if (better(oa, oai, a, ai)) { a = oa; ai = oai; }
+    if (better(ob, obi, b, bi)) { b = ob; bi = obi; }
+  }
+  int w = threadIdx.x >> 5, l = threadIdx.x & 31;
+  if (l == 0) {
+    sva[w] = a; sia[w] = ai;
+    svb[w] = b; sib[w] = bi;
+  }
+  __syncthreads();
+  a = sva[0]; ai = sia[0];
+  b = svb[0]; bi = sib[0];
+#pragma unroll
+  for (int i = 1; i < 8; i++) {
+    if (better(sva[i], sia[i], a, ai)) { a = sva[i]; ai = sia[i]; }
+    if (better(svb[i], sib[i], b, bi)) { b = svb[i]; bi = sib[i]; }
+  }
+  __syncthreads();
+}
+
 __device__ __forceinline__ uint64_t splitmix64(uint64_t z) {
   z += 0x9E3779B97F4A7C15ull;
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -184,7 +217,7 @@ __device__ __forceinline__ float unfx(unsigned long long u) { return (float)(lon
 template <class C> __host__ __device__ constexpr size_t smem_bytes() {
   size_t aw = (64 + C::T + 2048 + 32 + 64) * 4;                 // q, scores, reduce, scratch, o
   size_t ud = (C::D + 2048 + 64 + 16 + 64) * 4;                 // xs, reduce, res, scratch, gelu
-  size_t hd = (C::D + 16 + C::HR) * 4;
+  size_t hd = (C::D + 32 + C::HR) * 4;
   size_t m = aw > ud ? aw : ud;
   return m > hd ? m : hd;
 }
@@ -507,7 +540,7 @@ __device__ __forceinline__ void task_head(const Params<C>& P, int t, char* smem)
   static_assert(RPW % RB == 0, "HR");
   float* xs = (float*)smem;
   float* scratch = xs + C::D;         // 16
-  float* lg = scratch + 16;           // HR
+  float* lg = scratch + 32;           // HR
   const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
   const int vbase = t * C::HR + w * RPW;
   uint4 cur[RB][NCH], nxt[RB][NCH];
@@ -566,9 +599,15 @@ __device__ __forceinline__ void task_head(const Params<C>& P, int t, char* smem)
     }
   }
   float b0 = v0; int i0 = gi;
-  block_argmax(b0, i0, sv, si);
   float b1 = v1; int i1 = gi;
+#if DECODE_HEAD_FUSED_ARGMAX
+  float* svb = scratch + 16;
+  int* sib = (int*)(scratch + 24);
+  block_argmax_pair(b0, i0, b1, i1, sv, si, svb, sib);
+#else
+  block_argmax(b0, i0, sv, si);
   block_argmax(b1, i1, sv, si);
+#endif
   if (tid == 0) {
     st->cand_v[0][t] = b0; st->cand_i[0][t] = i0;
     st->cand_v[1][t] = b1; st->cand_i[1][t] = i1;
